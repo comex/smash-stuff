@@ -1,7 +1,7 @@
 import sys, struct
 from collections import namedtuple
 
-class Op:
+class SerOp:
     pass
 for i, name in enumerate('''
 SERIAL_NEW
@@ -25,7 +25,7 @@ TARRAY
 TMAP
 TVALUES
 '''.strip().split()):
-    setattr(Op, name, i)
+    setattr(SerOp, name, i)
 
 class XNull: pass
 class XUndefined: pass
@@ -36,7 +36,97 @@ XClassInfo = namedtuple('XClassInfo', 'scope_info instance_variable_size instanc
 XFunInfo = namedtuple('XFunInfo', 'scope_info max_stack max_variable name_number min_param_count max_param_count')
 XExceptInfo = namedtuple('XExceptInfo', 'catch_pc finally_pc end_pc')
 XLineNumberInfo = namedtuple('XLineNumberInfo', 'start_pc lineno')
-XClass = namedtuple('XClass', 'codes scope_info class_info except_info line_number_info once_count source_file_name identifier_table value_table breakpoint_cond_map')
+
+class Inst:
+    classes = {}
+
+def inst(name, op, fields):
+    fields = fields.split()
+    cls = namedtuple(name, fields[1::2])
+    cls.FMT = '<B'
+    for fmt in ''.join(fields[::2]):
+        cls.FMT += 'x' * (-struct.calcsize(cls.FMT) % struct.calcsize(fmt))
+        cls.FMT += fmt
+    cls.OP = op
+    cls.SIZE = struct.calcsize(cls.FMT)
+    setattr(Inst, name, cls)
+    Inst.classes[op] = cls
+
+def inst_rts(name, op, **kwargs):
+    inst(name, op, 'b result b target b stack_base', **kwargs)
+def inst_rlrsa(name, op, **kwargs):
+    inst(name, op, 'b result b lhs b rhs b stack_base B assign', **kwargs)
+def inst_lrs(name, op, **kwargs):
+    inst(name, op, 'b lhs b rhs b stack_base', **kwargs)
+
+inst('Line', 0, '')
+inst('LoadValue', 1, 'b result B value')
+inst('LoadConstant', 2, 'b result H value_number')
+inst('LoadInt1Byte', 3, 'b result b value')
+inst('LoadFloat1Byte', 4, 'b result b value')
+inst('LoadCallee', 5, 'b result')
+inst('LoadThis', 6, 'b result')
+inst('Copy', 7, 'b result b target')
+inst_rts('Inc', 8)
+inst_rts('Dec', 9)
+inst_rts('Pos', 10)
+inst_rts('Neg', 11)
+inst_rts('Com', 12)
+inst_rlrsa('Add', 13)
+inst_rlrsa('Sub', 14)
+inst_rlrsa('Cat', 15)
+inst_rlrsa('Mul', 16)
+inst_rlrsa('Div', 17)
+inst_rlrsa('Mod', 18)
+inst_rlrsa('And', 19)
+inst_rlrsa('Or',  20)
+inst_rlrsa('Xor', 21)
+inst_rlrsa('Shl', 22)
+inst_rlrsa('Shr', 23)
+inst_rlrsa('Ushr', 24)
+inst('At', 25, 'b result b target b index b stack_base')
+inst('SetAt', 26, 'b result b target b index b stack_base')
+inst('Goto', 27, 'h address')
+inst('Not', 28, 'b result b target')
+inst('If', 29, 'b target h address_true h address_false')
+inst_lrs('IfEq', 30)
+inst_lrs('IfLt', 31)
+inst_lrs('IfRawEq', 32)
+inst_lrs('IfIs', 33)
+inst_lrs('IfIn', 34)
+inst('IfUndefined', 35, 'b target h address_true h address_false')
+inst('IfDebug', 36, 'h address')
+inst('Push', 37, 'b target')
+inst('Pop', 38, 'b result')
+inst('AdjustValues', 39, 'B stack_base B result_count B need_result_count')
+inst('LocalVariable', 40, 'b result H number B depth')
+inst('SetLocalVariable', 41, 'b target H number B depth')
+inst('InstanceVariable', 42, 'b result h info_number B number')
+inst('SetInstanceVariable', 43, 'b value h info_number B number')
+inst('InstanceVariableByName', 44, 'b result H identifier_number')
+inst('SetInstanceVariableByName', 45, 'b value H identifier_number')
+inst('FilelocalVariable', 46, 'b result H value_number')
+inst('SetFilelocalVariable', 47, 'b value H value_number')
+inst('FilelocalVariableByName', 48, 'b result H identifier_number')
+inst('SetFilelocalVariableByName', 49, 'b value H identifier_number')
+
+class NoSlots(object):
+    pass
+class XCode(NoSlots, namedtuple('XCode', 'codes scope_info class_info except_info line_number_info once_count source_file_name identifier_table value_table breakpoint_cond_map')):
+    def __init__(self, *args, **kwargs):
+        super(XCode, self).__init__(*args, **kwargs)
+        self.decode = []
+        codes = bytearray(struct.pack('<%sH' % len(self.codes), *self.codes))
+        i = 0
+        while i < len(codes):
+            oi = i
+            op = codes[i]
+            cls = Inst.classes[op]
+            print cls, cls.FMT
+            inst = cls(*struct.unpack(cls.FMT, codes[i:i+cls.SIZE])[1:])
+            i += cls.SIZE
+            self.decode.append(inst)
+
 
 class Deserializer:
     def __init__(self, data):
@@ -55,61 +145,61 @@ class Deserializer:
         return self.read(1)[0]
     def deserialize(self):
         op = self.read8()
-        if op == Op.SERIAL_NEW:
+        if op == SerOp.SERIAL_NEW:
             class_ptr = self.deserialize()
             the_map = self.deserialize()
             self.values.append('<unknown deserialize result>')
             return ('serial_new', class_ptr, the_map)
-        elif op == Op.NAME:
+        elif op == SerOp.NAME:
             vi = len(self.values)
             self.values.append(None)
             v = self.values[vi] = self.demangle(self.deserialize())
             return v
-        elif op == Op.REFERENCE:
+        elif op == SerOp.REFERENCE:
             return self.values[self.readx('I')]
-        elif op == Op.TNULL:
+        elif op == SerOp.TNULL:
             return XNull()
-        elif op == Op.TUNDEFINED:
+        elif op == SerOp.TUNDEFINED:
             return XUndefined()
-        elif op == Op.TINT32:
+        elif op == SerOp.TINT32:
             return self.readx('i')
-        elif op == Op.TFLOAT32:
+        elif op == SerOp.TFLOAT32:
             return self.readx('f')
-        elif op == Op.TINT64:
+        elif op == SerOp.TINT64:
             return self.readx('q')
-        elif op == Op.TFLOAT64:
+        elif op == SerOp.TFLOAT64:
             return self.readx('d')
-        elif op == Op.TSTRING8:
+        elif op == SerOp.TSTRING8:
             return self.deserialize_string('B', False)
-        elif op == Op.TID8:
+        elif op == SerOp.TID8:
             return self.deserialize_string('B', True)
-        elif op == Op.TSTRING16:
+        elif op == SerOp.TSTRING16:
             return self.deserialize_string('H', False)
-        elif op == Op.TID16:
+        elif op == SerOp.TID16:
             return self.deserialize_string('H', True)
-        elif op == Op.TSTRING32:
+        elif op == SerOp.TSTRING32:
             return self.deserialize_string('I', False)
-        elif op == Op.TID32:
+        elif op == SerOp.TID32:
             return self.deserialize_string('I', True)
-        elif op == Op.TARRAY:
+        elif op == SerOp.TARRAY:
             count = self.readx('I')
             ret = [self.deserialize() for i in xrange(count)]
             self.values.append(ret)
             return ret
-        elif op == Op.TVALUES:
+        elif op == SerOp.TVALUES:
             head = self.deserialize()
             tail = self.deserialize()
             ret = (head, tail)
             self.values.append(ret)
             return ret
-        elif op == Op.TMAP:
+        elif op == SerOp.TMAP:
             count = self.readx('I')
             ret = {self.deserialize(): self.deserialize() for i in xrange(count)}
             self.values.append(ret)
             return ret
-        elif op == Op.TTRUE:
+        elif op == SerOp.TTRUE:
             return True
-        elif op == Op.TFALSE:
+        elif op == SerOp.TFALSE:
             return False
         elif op == ord('x'):
             return self.deserialize_code()
@@ -143,7 +233,7 @@ class Deserializer:
         value_table = [self.deserialize() for i in xrange(self.readx('H'))]
         breakpoint_cond_map = self.deserialize()
 
-        ret = self.values[vi] = XClass(codes, scope_info, class_info, except_info, line_number_info, once_count, source_file_name, identifier_table, value_table, breakpoint_cond_map)
+        ret = self.values[vi] = XCode(codes, scope_info, class_info, except_info, line_number_info, once_count, source_file_name, identifier_table, value_table, breakpoint_cond_map)
         return ret
 
     def deserialize_scope_info(self):
@@ -161,4 +251,8 @@ class Deserializer:
     def deserialize_line_number_info(self):
         return XLineNumberInfo(self.readx('I'), self.readx('H'))
 
-print Deserializer(open(sys.argv[1]).read()).deserialize()
+stuff = Deserializer(open(sys.argv[1]).read()).deserialize()
+if isinstance(stuff, XCode):
+    stuff.disassemble()
+else:
+    print stuff
